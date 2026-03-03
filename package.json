@@ -1,0 +1,23 @@
+{
+  "name": "pi-tmux-targets",
+  "version": "0.1.0",
+  "description": "Tmux pane targeting and subagent orchestration extension for pi",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "tmux",
+    "subagent"
+  ],
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./extensions/tmux-target.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*",
+    "@sinclair/typebox": "*"
+  }
+}
