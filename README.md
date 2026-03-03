@@ -46,6 +46,34 @@ Then reload pi:
 /reload
 ```
 
+## Uninstall
+
+### If installed via `pi install` (global)
+
+```bash
+pi remove git:github.com/Naveenxyz/pi-tmux-targets
+```
+
+### If installed via `pi install -l` (project-local)
+
+Run from the project where you installed it:
+
+```bash
+pi remove -l git:github.com/Naveenxyz/pi-tmux-targets
+```
+
+### If manually copied extension file
+
+```bash
+rm -f ~/.pi/agent/extensions/tmux-target.ts
+```
+
+Then reload pi:
+
+```text
+/reload
+```
+
 ## Usage
 
 - List targets: ask pi to call `tmux_list_targets`
