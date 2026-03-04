@@ -1,4 +1,7 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { StringEnum } from "@mariozechner/pi-ai";
 import { matchesKey } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 
@@ -39,7 +42,44 @@ interface CurrentPaneContext {
 	windowId: string;
 }
 
+type AsyncJobStatus = "running" | "success" | "error" | "cancelled";
+
+interface AsyncJobRecord {
+	version: 1;
+	jobId: string;
+	name: string;
+	task: string;
+	status: AsyncJobStatus;
+	paneId?: string;
+	createdAt: string;
+	doneAt?: string;
+	cwd: string;
+	parentSessionFile: string | null;
+	autoKillOnDone: boolean;
+	callbackSent: boolean;
+	logPath: string;
+	stderrPath: string;
+	donePath: string;
+	scriptPath: string;
+	taskPath: string;
+	model?: string;
+	tools?: string;
+}
+
+interface AsyncDoneRecord {
+	jobId: string;
+	paneId?: string;
+	status: "success" | "error" | "cancelled";
+	exitCode: number;
+	finishedAt: string;
+}
+
 const TMUX_TARGET_ENTRY_TYPE = "tmux-target";
+const TMUX_JOBS_DIR = path.join(getAgentDir(), "tmux-target-jobs");
+const TMUX_JOBS_META_DIR = path.join(TMUX_JOBS_DIR, "jobs");
+const TMUX_JOBS_TASKS_DIR = path.join(TMUX_JOBS_DIR, "tasks");
+const TMUX_JOBS_LOGS_DIR = path.join(TMUX_JOBS_DIR, "logs");
+const TMUX_JOBS_SCRIPTS_DIR = path.join(TMUX_JOBS_DIR, "scripts");
 const TMUX_LIST_FORMAT =
 	"#{session_name}\t#{window_index}\t#{window_id}\t#{window_name}\t#{pane_index}\t#{pane_id}\t#{pane_title}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_active}";
 
@@ -68,6 +108,214 @@ function parseRegex(raw: string): RegExp {
 		return new RegExp(slashMatch[1], slashMatch[2]);
 	}
 	return new RegExp(trimmed, "i");
+}
+
+function ensureDir(dirPath: string): void {
+	if (!fs.existsSync(dirPath)) {
+		fs.mkdirSync(dirPath, { recursive: true });
+	}
+}
+
+function ensureJobsDirs(): void {
+	ensureDir(TMUX_JOBS_DIR);
+	ensureDir(TMUX_JOBS_META_DIR);
+	ensureDir(TMUX_JOBS_TASKS_DIR);
+	ensureDir(TMUX_JOBS_LOGS_DIR);
+	ensureDir(TMUX_JOBS_SCRIPTS_DIR);
+}
+
+function makeJobId(): string {
+	return `job_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function writeJsonAtomic(filePath: string, data: unknown): void {
+	const tmpPath = `${filePath}.tmp`;
+	fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), "utf-8");
+	fs.renameSync(tmpPath, filePath);
+}
+
+function readJsonFile<T>(filePath: string): T | undefined {
+	try {
+		const raw = fs.readFileSync(filePath, "utf-8");
+		return JSON.parse(raw) as T;
+	} catch {
+		return undefined;
+	}
+}
+
+function parseAsyncJobRecord(data: unknown): AsyncJobRecord | undefined {
+	if (!isRecord(data)) return undefined;
+	if (data.version !== 1) return undefined;
+	if (typeof data.jobId !== "string") return undefined;
+	if (typeof data.name !== "string") return undefined;
+	if (typeof data.task !== "string") return undefined;
+	if (typeof data.status !== "string") return undefined;
+	if (typeof data.createdAt !== "string") return undefined;
+	if (typeof data.cwd !== "string") return undefined;
+	if (typeof data.parentSessionFile !== "string" && data.parentSessionFile !== null) return undefined;
+	if (typeof data.autoKillOnDone !== "boolean") return undefined;
+	if (typeof data.callbackSent !== "boolean") return undefined;
+	if (typeof data.logPath !== "string") return undefined;
+	if (typeof data.stderrPath !== "string") return undefined;
+	if (typeof data.donePath !== "string") return undefined;
+	if (typeof data.scriptPath !== "string") return undefined;
+	if (typeof data.taskPath !== "string") return undefined;
+
+	const status = data.status as AsyncJobStatus;
+	if (status !== "running" && status !== "success" && status !== "error" && status !== "cancelled") return undefined;
+
+	return {
+		version: 1,
+		jobId: data.jobId,
+		name: data.name,
+		task: data.task,
+		status,
+		paneId: typeof data.paneId === "string" ? data.paneId : undefined,
+		createdAt: data.createdAt,
+		doneAt: typeof data.doneAt === "string" ? data.doneAt : undefined,
+		cwd: data.cwd,
+		parentSessionFile: data.parentSessionFile,
+		autoKillOnDone: data.autoKillOnDone,
+		callbackSent: data.callbackSent,
+		logPath: data.logPath,
+		stderrPath: data.stderrPath,
+		donePath: data.donePath,
+		scriptPath: data.scriptPath,
+		taskPath: data.taskPath,
+		model: typeof data.model === "string" ? data.model : undefined,
+		tools: typeof data.tools === "string" ? data.tools : undefined,
+	};
+}
+
+function listAsyncJobs(): AsyncJobRecord[] {
+	ensureJobsDirs();
+	const jobs: AsyncJobRecord[] = [];
+	for (const fileName of fs.readdirSync(TMUX_JOBS_META_DIR)) {
+		if (!fileName.endsWith(".job.json")) continue;
+		const parsed = parseAsyncJobRecord(readJsonFile(path.join(TMUX_JOBS_META_DIR, fileName)));
+		if (parsed) jobs.push(parsed);
+	}
+	jobs.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+	return jobs;
+}
+
+function jobMetaPath(jobId: string): string {
+	return path.join(TMUX_JOBS_META_DIR, `${jobId}.job.json`);
+}
+
+function updateJobMeta(job: AsyncJobRecord): void {
+	writeJsonAtomic(jobMetaPath(job.jobId), job);
+}
+
+function getAssistantTextFromMessage(message: unknown): string {
+	if (!isRecord(message)) return "";
+	if (message.role !== "assistant") return "";
+	const content = message.content;
+	if (!Array.isArray(content)) return "";
+	for (const part of content) {
+		if (!isRecord(part)) continue;
+		if (part.type === "text" && typeof part.text === "string" && part.text.trim().length > 0) {
+			return part.text.trim();
+		}
+	}
+	return "";
+}
+
+function summarizeJsonLog(logPath: string): { finalOutput: string; progress: string } {
+	if (!fs.existsSync(logPath)) return { finalOutput: "", progress: "No log yet" };
+	try {
+		const raw = fs.readFileSync(logPath, "utf-8");
+		const lines = raw
+			.split(/\r?\n/)
+			.map((line) => line.trim())
+			.filter((line) => line.length > 0);
+		let finalOutput = "";
+		let progress = "Working...";
+		for (const line of lines.slice(-600)) {
+			let event: unknown;
+			try {
+				event = JSON.parse(line);
+			} catch {
+				continue;
+			}
+			if (!isRecord(event)) continue;
+			if (event.type === "tool_execution_start") {
+				progress = `Running tool: ${typeof event.toolName === "string" ? event.toolName : "unknown"}`;
+			}
+			if (event.type === "tool_execution_end") {
+				progress = `Finished tool: ${typeof event.toolName === "string" ? event.toolName : "unknown"}`;
+			}
+			if (event.type === "message_end") {
+				const text = getAssistantTextFromMessage(event.message);
+				if (text.length > 0) {
+					finalOutput = text;
+					progress = truncate(text.replace(/\s+/g, " "), 120);
+				}
+			}
+		}
+		return { finalOutput, progress };
+	} catch {
+		return { finalOutput: "", progress: "Unable to read log" };
+	}
+}
+
+function readTail(filePath: string, lines = 12): string {
+	if (!fs.existsSync(filePath)) return "";
+	try {
+		const raw = fs.readFileSync(filePath, "utf-8");
+		return raw
+			.split(/\r?\n/)
+			.filter((line) => line.trim().length > 0)
+			.slice(-lines)
+			.join("\n");
+	} catch {
+		return "";
+	}
+}
+
+function buildAsyncWorkerScript(args: {
+	jobId: string;
+	taskPath: string;
+	logPath: string;
+	stderrPath: string;
+	donePath: string;
+	model?: string;
+	tools?: string;
+}): string {
+	return `#!/usr/bin/env bash
+set +e
+JOB_ID=${shellQuote(args.jobId)}
+TASK_PATH=${shellQuote(args.taskPath)}
+LOG_PATH=${shellQuote(args.logPath)}
+STDERR_PATH=${shellQuote(args.stderrPath)}
+DONE_PATH=${shellQuote(args.donePath)}
+MODEL=${shellQuote(args.model ?? "")}
+TOOLS=${shellQuote(args.tools ?? "")}
+
+TASK_CONTENT="$(cat "$TASK_PATH")"
+CMD_ARGS=(--mode json -p --no-session)
+if [ -n "$MODEL" ]; then
+  CMD_ARGS+=(--model "$MODEL")
+fi
+if [ -n "$TOOLS" ]; then
+  CMD_ARGS+=(--tools "$TOOLS")
+fi
+
+pi "\${CMD_ARGS[@]}" "$TASK_CONTENT" >"$LOG_PATH" 2>"$STDERR_PATH"
+EXIT_CODE=$?
+STATUS="error"
+if [ "$EXIT_CODE" -eq 0 ]; then
+  STATUS="success"
+fi
+FINISHED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+PANE_ID="\${TMUX_PANE:-unknown}"
+TMP_PATH="\${DONE_PATH}.tmp"
+cat >"$TMP_PATH" <<JSON
+{"jobId":"$JOB_ID","paneId":"$PANE_ID","status":"$STATUS","exitCode":$EXIT_CODE,"finishedAt":"$FINISHED_AT"}
+JSON
+mv "$TMP_PATH" "$DONE_PATH"
+exit "$EXIT_CODE"
+`;
 }
 
 function parsePaneLine(line: string): PaneInfo | undefined {
@@ -356,6 +604,9 @@ export default function tmuxTargetExtension(pi: ExtensionAPI) {
 	const trackedPaneIds = new Set<string>();
 	const paneCache = new Map<string, PaneInfo>();
 	const subagentRootPaneByWindowId = new Map<string, string>();
+	let currentSessionFile: string | null = null;
+	let jobsWatcher: ReturnType<typeof setInterval> | null = null;
+	let jobsPolling = false;
 
 	const cachePanes = (panes: PaneInfo[]): void => {
 		for (const pane of panes) {
@@ -409,7 +660,12 @@ export default function tmuxTargetExtension(pi: ExtensionAPI) {
 
 	const updateStatus = (ctx: ExtensionContext): void => {
 		if (!ctx.hasUI) return;
-		ctx.ui.setStatus("tmux-target", trackedPaneIds.size > 0 ? `tmux: ${trackedPaneIds.size} tracked` : undefined);
+		const runningJobs = listAsyncJobs().map(refreshJobFromDone).filter((job) => job.status === "running").length;
+		if (trackedPaneIds.size === 0 && runningJobs === 0) {
+			ctx.ui.setStatus("tmux-target", undefined);
+			return;
+		}
+		ctx.ui.setStatus("tmux-target", `tmux: ${trackedPaneIds.size} tracked | jobs: ${runningJobs} running`);
 	};
 
 	const restoreState = async (ctx: ExtensionContext): Promise<void> => {
@@ -476,33 +732,40 @@ export default function tmuxTargetExtension(pi: ExtensionAPI) {
 		return panes.find((pane) => pane.isActive) ?? panes[0];
 	};
 
-	const launchSubagent = async (
+	const loadJob = (jobId: string): AsyncJobRecord | undefined => {
+		return parseAsyncJobRecord(readJsonFile(jobMetaPath(jobId)));
+	};
+
+	const refreshJobFromDone = (job: AsyncJobRecord): AsyncJobRecord => {
+		const done = readJsonFile<AsyncDoneRecord>(job.donePath);
+		if (!done) return job;
+		job.status = done.status;
+		job.doneAt = done.finishedAt;
+		if (typeof done.paneId === "string" && done.paneId.length > 0) {
+			job.paneId = done.paneId;
+		}
+		return job;
+	};
+
+	const launchPaneWithCommand = async (
 		cwd: string,
+		command: string,
 		options?: {
-			prompt?: string;
 			horizontal?: boolean;
-			noSession?: boolean;
 			track?: boolean;
+			targetPane?: string;
 		},
 	): Promise<PaneInfo | undefined> => {
-		const piArgs: string[] = [];
-		if (options?.noSession === true) {
-			piArgs.push("--no-session");
-		}
-		const prompt = options?.prompt?.trim();
-		if (prompt && prompt.length > 0) {
-			piArgs.push(prompt);
-		}
-
-		const piCommand = `pi${piArgs.length > 0 ? ` ${piArgs.map(shellQuote).join(" ")}` : ""}`;
 		const [panesBeforeLaunch, currentPaneContext] = await Promise.all([listPanes(pi), getCurrentPaneContext(pi)]);
 		syncLiveState(panesBeforeLaunch);
 
 		const splitArgs = ["split-window", "-P", "-F", "#{pane_id}"];
 		if (options?.horizontal === true) {
-			splitArgs.push("-h");
+			splitArgs.push("-h", "-d");
 		} else if (options?.horizontal === false) {
-			splitArgs.push("-v");
+			splitArgs.push("-v", "-d");
+		} else if (options?.targetPane) {
+			splitArgs.push("-t", options.targetPane, "-d");
 		} else if (currentPaneContext) {
 			const rootPaneId = subagentRootPaneByWindowId.get(currentPaneContext.windowId);
 			const existingRoot = rootPaneId
@@ -513,22 +776,20 @@ export default function tmuxTargetExtension(pi: ExtensionAPI) {
 			} else {
 				splitArgs.push("-t", currentPaneContext.paneId, "-h", "-p", "50", "-d");
 			}
+		} else {
+			splitArgs.push("-d");
 		}
-		splitArgs.push("-c", cwd, piCommand);
+		splitArgs.push("-c", cwd, command);
 
 		const paneId = (await runTmux(pi, splitArgs, 5000)).trim();
-		if (paneId.length === 0) {
-			return undefined;
-		}
+		if (paneId.length === 0) return undefined;
 
 		const panes = await listPanes(pi);
 		syncLiveState(panes);
 		const pane = panes.find((entry) => entry.paneId === paneId);
-		if (pane) {
-			paneCache.set(pane.paneId, pane);
-		}
+		if (pane) paneCache.set(pane.paneId, pane);
 
-		if (currentPaneContext && options?.horizontal === undefined && pane) {
+		if (currentPaneContext && options?.horizontal === undefined && !options?.targetPane && pane) {
 			const existingRootId = subagentRootPaneByWindowId.get(currentPaneContext.windowId);
 			const existingRootIsLive =
 				typeof existingRootId === "string" &&
@@ -538,20 +799,124 @@ export default function tmuxTargetExtension(pi: ExtensionAPI) {
 			}
 		}
 
-		if (options?.track !== false) {
-			trackedPaneIds.add(paneId);
-		}
+		if (options?.track !== false) trackedPaneIds.add(paneId);
 		persistState();
 		return pane;
 	};
 
-	pi.on("session_start", async (_event, ctx) => restoreState(ctx));
-	pi.on("session_switch", async (_event, ctx) => restoreState(ctx));
-	pi.on("session_fork", async (_event, ctx) => restoreState(ctx));
-	pi.on("session_tree", async (_event, ctx) => restoreState(ctx));
+	const launchSubagent = async (
+		cwd: string,
+		options?: {
+			prompt?: string;
+			horizontal?: boolean;
+			noSession?: boolean;
+			track?: boolean;
+			targetPane?: string;
+		},
+	): Promise<PaneInfo | undefined> => {
+		const piArgs: string[] = [];
+		if (options?.noSession === true) piArgs.push("--no-session");
+		const prompt = options?.prompt?.trim();
+		if (prompt && prompt.length > 0) piArgs.push(prompt);
+		const piCommand = `pi${piArgs.length > 0 ? ` ${piArgs.map(shellQuote).join(" ")}` : ""}`;
+		return launchPaneWithCommand(cwd, piCommand, {
+			horizontal: options?.horizontal,
+			track: options?.track,
+			targetPane: options?.targetPane,
+		});
+	};
+
+	const pollAsyncJobs = async (): Promise<void> => {
+		if (jobsPolling) return;
+		jobsPolling = true;
+		try {
+			for (const raw of listAsyncJobs()) {
+				const job = refreshJobFromDone(raw);
+				if (!fs.existsSync(job.donePath)) {
+					if (job.status !== "running") {
+						job.status = "running";
+						updateJobMeta(job);
+					}
+					continue;
+				}
+				if (job.callbackSent) continue;
+				if (job.parentSessionFile !== currentSessionFile) continue;
+
+				const done = readJsonFile<AsyncDoneRecord>(job.donePath);
+				if (!done) continue;
+				job.status = done.status;
+				job.doneAt = done.finishedAt;
+				if (typeof done.paneId === "string" && done.paneId.length > 0) {
+					job.paneId = done.paneId;
+				}
+
+				if (job.autoKillOnDone && job.paneId) {
+					await pi.exec("tmux", ["kill-pane", "-t", job.paneId], { timeout: 2000, cwd: job.cwd });
+					trackedPaneIds.delete(job.paneId);
+				}
+
+				const summary = summarizeJsonLog(job.logPath);
+				const stderrTail = readTail(job.stderrPath, 12);
+				let callback = "";
+				callback += `[tmux-subagent] ${job.name} finished\n`;
+				callback += `jobId: ${job.jobId}\n`;
+				callback += `pane: ${job.paneId ?? "unknown"}\n`;
+				callback += `status: ${done.status} (exit ${done.exitCode})\n`;
+				callback += job.autoKillOnDone
+					? "pane lifecycle: auto-killed on completion\n\n"
+					: "pane lifecycle: kept alive\n\n";
+				if (summary.finalOutput.length > 0) callback += summary.finalOutput;
+				else if (stderrTail.length > 0) callback += `stderr tail:\n${stderrTail}`;
+				else callback += "(no output captured)";
+
+				job.callbackSent = true;
+				updateJobMeta(job);
+				persistState();
+				pi.sendUserMessage(callback, { deliverAs: "followUp" });
+			}
+		} finally {
+			jobsPolling = false;
+		}
+	};
+
+	const ensureJobsWatcher = (): void => {
+		if (jobsWatcher) return;
+		jobsWatcher = setInterval(() => {
+			void pollAsyncJobs();
+		}, 1500);
+	};
+
+	const stopJobsWatcher = (): void => {
+		if (!jobsWatcher) return;
+		clearInterval(jobsWatcher);
+		jobsWatcher = null;
+	};
+
+	pi.on("session_start", async (_event, ctx) => {
+		ensureJobsDirs();
+		currentSessionFile = ctx.sessionManager.getSessionFile() ?? null;
+		await restoreState(ctx);
+		ensureJobsWatcher();
+	});
+	pi.on("session_switch", async (_event, ctx) => {
+		currentSessionFile = ctx.sessionManager.getSessionFile() ?? null;
+		await restoreState(ctx);
+	});
+	pi.on("session_fork", async (_event, ctx) => {
+		currentSessionFile = ctx.sessionManager.getSessionFile() ?? null;
+		await restoreState(ctx);
+	});
+	pi.on("session_tree", async (_event, ctx) => {
+		currentSessionFile = ctx.sessionManager.getSessionFile() ?? null;
+		await restoreState(ctx);
+	});
+	pi.on("session_shutdown", async () => {
+		stopJobsWatcher();
+	});
 	pi.on("turn_start", async (_event, ctx) => {
 		try {
 			await refreshLiveTracking();
+			await pollAsyncJobs();
 		} catch {
 			// Ignore tmux refresh errors during turn start.
 		}
@@ -614,11 +979,24 @@ export default function tmuxTargetExtension(pi: ExtensionAPI) {
 				lines.push(`Tracked count: ${trackedPaneIds.size}`);
 				lines.push("Targets:");
 				lines.push(formatTargetsLines(trackedPaneIds, paneCache));
+
+				const jobs = listAsyncJobs().map(refreshJobFromDone);
+				const runningJobs = jobs.filter((job) => job.status === "running");
+				if (runningJobs.length > 0) {
+					lines.push("");
+					lines.push(`Running async jobs: ${runningJobs.length}`);
+					for (const job of runningJobs.slice(0, 8)) {
+						const summary = summarizeJsonLog(job.logPath);
+						lines.push(`- ${job.jobId} ${job.paneId ?? "?"} ${job.name} :: ${summary.progress}`);
+					}
+				}
+
 				updateStatus(ctx);
 				return {
 					content: [{ type: "text", text: lines.join("\n") }],
 					details: {
 						trackedPaneIds: Array.from(trackedPaneIds),
+						runningJobs: runningJobs.map((job) => ({ jobId: job.jobId, paneId: job.paneId, name: job.name })),
 					},
 				};
 			} catch (error) {
@@ -695,14 +1073,23 @@ export default function tmuxTargetExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
-		name: "tmux_launch_subagent",
-		label: "tmux launch subagent",
-		description: "Split current tmux window, launch a new pi in the new pane, and track it by default.",
+		name: "tmux_subagent_job",
+		label: "tmux subagent job",
+		description:
+			"Async subagent jobs in tmux. start spawns a pane and runs a task; when done, parent gets follow-up callback and pane can auto-kill. list/progress/cancel manage jobs.",
 		parameters: Type.Object({
-			prompt: Type.Optional(Type.String({ description: "Optional startup prompt for new pi" })),
-			horizontal: Type.Optional(Type.Boolean({ description: "Use horizontal split (-h)" })),
-			noSession: Type.Optional(Type.Boolean({ description: "Launch with --no-session" })),
-			track: Type.Optional(Type.Boolean({ description: "Track launched pane (default: true)" })),
+			action: StringEnum(["start", "list", "progress", "cancel"] as const),
+			task: Type.Optional(Type.String({ description: "Task prompt for start" })),
+			jobId: Type.Optional(Type.String({ description: "Job id for progress/cancel" })),
+			name: Type.Optional(Type.String({ description: "Optional name for start" })),
+			cwd: Type.Optional(Type.String({ description: "Optional working directory for start" })),
+			horizontal: Type.Optional(Type.Boolean({ description: "Force horizontal split (-h)" })),
+			targetPane: Type.Optional(Type.String({ description: "Optional tmux target pane (e.g. %3)" })),
+			model: Type.Optional(Type.String({ description: "Optional model override for worker" })),
+			tools: Type.Optional(Type.String({ description: "Optional comma-separated worker tools" })),
+			autoKillOnDone: Type.Optional(Type.Boolean({ description: "Kill pane when job finishes (default true)", default: true })),
+			track: Type.Optional(Type.Boolean({ description: "Track spawned pane (default true)" })),
+			limit: Type.Optional(Type.Number({ description: "Max rows for list/progress", default: 20 })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			if (!inTmux()) {
@@ -712,37 +1099,204 @@ export default function tmuxTargetExtension(pi: ExtensionAPI) {
 					details: {},
 				};
 			}
+			ensureJobsDirs();
 
-			try {
-				const pane = await launchSubagent(ctx.cwd, {
-					prompt: params.prompt,
+			if (params.action === "start") {
+				const task = params.task?.trim();
+				if (!task) {
+					return {
+						content: [{ type: "text", text: "start requires task" }],
+						isError: true,
+						details: {},
+					};
+				}
+
+				const jobId = makeJobId();
+				const name = (params.name?.trim() || truncate(task.replace(/\s+/g, " "), 36)).replace(/\n/g, " ");
+				const cwd = params.cwd ? path.resolve(ctx.cwd, params.cwd) : ctx.cwd;
+				const autoKillOnDone = params.autoKillOnDone !== false;
+				const track = params.track !== false;
+
+				const taskPath = path.join(TMUX_JOBS_TASKS_DIR, `${jobId}.task.txt`);
+				const scriptPath = path.join(TMUX_JOBS_SCRIPTS_DIR, `${jobId}.run.sh`);
+				const logPath = path.join(TMUX_JOBS_LOGS_DIR, `${jobId}.jsonl`);
+				const stderrPath = path.join(TMUX_JOBS_LOGS_DIR, `${jobId}.stderr.log`);
+				const donePath = path.join(TMUX_JOBS_META_DIR, `${jobId}.done.json`);
+
+				fs.writeFileSync(taskPath, task, "utf-8");
+				fs.writeFileSync(
+					scriptPath,
+					buildAsyncWorkerScript({
+						jobId,
+						taskPath,
+						logPath,
+						stderrPath,
+						donePath,
+						model: params.model,
+						tools: params.tools,
+					}),
+					{ mode: 0o700 },
+				);
+
+				const pane = await launchPaneWithCommand(cwd, `bash ${shellQuote(scriptPath)}`, {
 					horizontal: params.horizontal,
-					noSession: params.noSession === true,
-					track: params.track !== false,
+					targetPane: params.targetPane,
+					track,
 				});
 
+				const job: AsyncJobRecord = {
+					version: 1,
+					jobId,
+					name,
+					task,
+					status: "running",
+					paneId: pane?.paneId,
+					createdAt: new Date().toISOString(),
+					cwd,
+					parentSessionFile: ctx.sessionManager.getSessionFile() ?? null,
+					autoKillOnDone,
+					callbackSent: false,
+					logPath,
+					stderrPath,
+					donePath,
+					scriptPath,
+					taskPath,
+					model: params.model,
+					tools: params.tools,
+				};
+				updateJobMeta(job);
 				updateStatus(ctx);
+
 				return {
 					content: [
 						{
 							type: "text",
-							text: pane
-								? `Launched subagent in ${pane.paneId} (${paneIdentifier(pane)})`
-								: "Launched subagent pane",
+							text:
+								`Spawned async subagent job ${jobId}.\n` +
+								`pane: ${pane?.paneId ?? "unknown"}\n` +
+								`name: ${name}\n` +
+								`autoKillOnDone: ${autoKillOnDone}\n` +
+								"You can monitor with tmux_subagent_job(action=\"progress\") or tmux_list_targets.",
 						},
 					],
-					details: {
-						paneId: pane?.paneId,
-						trackedPaneIds: Array.from(trackedPaneIds),
-					},
+					details: { jobId, paneId: pane?.paneId, status: "running" },
 				};
-			} catch (error) {
+			}
+
+			if (params.action === "list") {
+				const limit = Math.max(1, Math.min(100, params.limit ?? 20));
+				const jobs = listAsyncJobs().map(refreshJobFromDone).slice(0, limit);
+				for (const job of jobs) updateJobMeta(job);
+				if (jobs.length === 0) {
+					return { content: [{ type: "text", text: "No async tmux jobs yet." }], details: { jobs: [] } };
+				}
+				const counts = {
+					running: jobs.filter((job) => job.status === "running").length,
+					success: jobs.filter((job) => job.status === "success").length,
+					error: jobs.filter((job) => job.status === "error").length,
+					cancelled: jobs.filter((job) => job.status === "cancelled").length,
+				};
+				const lines: string[] = [];
+				lines.push(
+					`Jobs: ${jobs.length} (running ${counts.running}, success ${counts.success}, error ${counts.error}, cancelled ${counts.cancelled})`,
+				);
+				lines.push("");
+				for (const job of jobs) {
+					lines.push(`${job.jobId} [${job.status}] ${job.paneId ?? "?"} ${job.name}`);
+				}
 				return {
-					content: [{ type: "text", text: `tmux launch error: ${error instanceof Error ? error.message : String(error)}` }],
+					content: [{ type: "text", text: lines.join("\n") }],
+					details: { jobs },
+				};
+			}
+
+			if (params.action === "progress") {
+				const limit = Math.max(1, Math.min(100, params.limit ?? 20));
+				const jobs = listAsyncJobs().map(refreshJobFromDone);
+				for (const job of jobs) updateJobMeta(job);
+				const selected = params.jobId ? jobs.filter((job) => job.jobId === params.jobId) : jobs.slice(0, limit);
+				if (selected.length === 0) {
+					return {
+						content: [{ type: "text", text: params.jobId ? `Job not found: ${params.jobId}` : "No jobs found" }],
+						isError: Boolean(params.jobId),
+						details: {},
+					};
+				}
+				const lines: string[] = [];
+				for (const job of selected) {
+					const summary = summarizeJsonLog(job.logPath);
+					lines.push(`${job.jobId} [${job.status}] ${job.paneId ?? "?"} ${job.name}`);
+					lines.push(`progress: ${summary.progress}`);
+					if (job.status === "running" && job.paneId) {
+						const paneResult = await pi.exec("tmux", ["capture-pane", "-p", "-t", job.paneId, "-S", "-40"], {
+							timeout: 1500,
+							cwd: ctx.cwd,
+						});
+						if (paneResult.code === 0) {
+							const textTail = paneResult.stdout
+								.split(/\r?\n/)
+								.filter((line) => line.trim().length > 0)
+								.slice(-10)
+								.join("\n");
+							if (textTail.length > 0) lines.push(`pane tail:\n${textTail}`);
+						}
+					} else {
+						if (summary.finalOutput.length > 0) lines.push(`final:\n${summary.finalOutput}`);
+						const stderrTail = readTail(job.stderrPath, 10);
+						if (stderrTail.length > 0) lines.push(`stderr tail:\n${stderrTail}`);
+					}
+					lines.push("---");
+				}
+				return {
+					content: [{ type: "text", text: lines.join("\n") }],
+					details: { jobs: selected },
+				};
+			}
+
+			if (!params.jobId) {
+				return {
+					content: [{ type: "text", text: "cancel requires jobId" }],
 					isError: true,
 					details: {},
 				};
 			}
+			const job = loadJob(params.jobId);
+			if (!job) {
+				return {
+					content: [{ type: "text", text: `Job not found: ${params.jobId}` }],
+					isError: true,
+					details: {},
+				};
+			}
+
+			if (job.paneId) {
+				await pi.exec("tmux", ["kill-pane", "-t", job.paneId], { timeout: 1500, cwd: job.cwd });
+				trackedPaneIds.delete(job.paneId);
+			}
+			if (!fs.existsSync(job.donePath)) {
+				const doneRecord: AsyncDoneRecord = {
+					jobId: job.jobId,
+					paneId: job.paneId,
+					status: "cancelled",
+					exitCode: 130,
+					finishedAt: new Date().toISOString(),
+				};
+				writeJsonAtomic(job.donePath, doneRecord);
+			}
+			job.status = "cancelled";
+			job.doneAt = new Date().toISOString();
+			job.callbackSent = true;
+			updateJobMeta(job);
+			persistState();
+			updateStatus(ctx);
+			return {
+				content: [{ type: "text", text: `Cancelled job ${job.jobId}; pane ${job.paneId ?? "unknown"} killed.` }],
+				details: { job },
+			};
 		},
 	});
+
+	// Temporarily disabled to reduce overlap with tmux_subagent_job.
+	// Keep command /tmux-launch-subagent for manual workflow, but hide tool from LLM for now.
+	// pi.registerTool({ name: "tmux_launch_subagent", ... })
 }
