@@ -5,7 +5,7 @@ Tmux targeting + subagent layout extension for [pi](https://github.com/badlogic/
 It adds:
 - `tmux_list_targets` tool
 - `tmux_track_pane` tool
-- `tmux_launch_subagent` tool *(temporarily disabled; command still available)*
+- `tmux_launch_subagent` tool (interactive/steerable tmux subagent pane)
 - `tmux_subagent_job` tool (async jobs with callbacks)
 - `/tmux-targets` command (interactive target picker)
 - `/tmux-launch-subagent` command
@@ -81,16 +81,17 @@ Then reload pi:
 ## Usage
 
 - List targets: ask pi to call `tmux_list_targets`
+- Open `/tmux-targets`: Tab cycles scopes (`current` → `all` → `tracked`), `t` toggles, Enter applies+closes
 - Track/untrack pane:
   - `tmux_track_pane` with `pane: "%6"`
-  - `tmux_track_pane` with `untrack: true`
+  - `tmux_track_pane` with `pane: "%6", untrack: true` (or with `regex`)
 - Launch interactive subagent pane:
-  - use `/tmux-launch-subagent` command (tool temporarily disabled)
+  - use `tmux_launch_subagent` tool or `/tmux-launch-subagent` command
   - optional `horizontal: true` to force side split
   - optional `horizontal: false` to force vertical split
   - omit `horizontal` to use smart layout mode
 
-- Launch async subagent job:
+- Launch async subagent job (background, non-interactive worker):
   - `tmux_subagent_job` with `action: "start"` and `task`
   - optional `name`, `model`, `tools`, `autoKillOnDone` (default `true`)
   - returns `jobId` and spawned `paneId`
@@ -99,6 +100,7 @@ Then reload pi:
   - `tmux_subagent_job` with `action: "list"`
   - `tmux_subagent_job` with `action: "progress"` (optional `jobId`)
   - `tmux_subagent_job` with `action: "cancel"` and `jobId`
+  - by default, job list/progress/cancel are scoped to the current session; use `allSessions: true` to override
 
 ## Notes
 
